@@ -153,6 +153,9 @@ struct Bench {
     /// Number of bytes per chunk for each request
     #[arg(long)]
     chunk_len: usize,
+    /// The timeout in seconds.
+    #[arg(short, long, default_value = "5")]
+    timeout: f64,
 }
 
 #[tokio::main]
@@ -225,6 +228,8 @@ async fn run_bench(args: Bench) -> Result<()> {
     println!("spawning {} workers for {address}", args.workers);
 
     let mut set = JoinSet::new();
+    let timeout_duration = Duration::from_millis((args.timeout * 1000.0) as u64);
+
     for id in 0..args.workers {
         set.spawn(request_loop(
             args.out.clone(),
@@ -234,6 +239,7 @@ async fn run_bench(args: Bench) -> Result<()> {
             args.chunks,
             args.chunk_len,
             args.iters,
+            timeout_duration,
         ));
     }
 
@@ -255,12 +261,15 @@ async fn request_loop(
     chunks: usize,
     chunk_len: usize,
     iters: usize,
+    timeout: Duration,
 ) -> Result<()> {
     let mut file = std::fs::File::create(out.join(format!("{address}-{worker}-{total}.json")))?;
     writeln!(file, "[")?;
 
     for n in 1..=iters {
-        let data = run_request(address, &mut file, chunks, chunk_len).await?;
+        let data =
+            tokio::time::timeout(timeout, run_request(address, &mut file, chunks, chunk_len))
+                .await??;
 
         if n != iters {
             writeln!(file, "{data},")?;
