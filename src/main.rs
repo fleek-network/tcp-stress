@@ -4,21 +4,22 @@ use std::fs::File;
 use std::io::Write;
 use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
+use std::time::Duration;
 
-use anyhow::{anyhow, Result};
-use clap::Parser;
+use anyhow::{anyhow, bail, Context, Result};
+use clap::{Args, Command, Parser, Subcommand};
 use fleek_crypto::{ClientPublicKey, ClientSignature};
-use types::{HandshakeRequestFrame, ResponseFrame};
 use tcp_client::*;
 use tokio::net::TcpStream;
 use tokio::task::JoinSet;
 use tokio::time::Instant;
+use types::{HandshakeRequestFrame, ResponseFrame};
 
 mod tcp_client {
+    use crate::types::{HandshakeRequestFrame, RequestFrame, ResponseFrame};
     use anyhow::Result;
     use arrayref::array_ref;
     use bytes::{BufMut, Bytes, BytesMut};
-    use crate::types::{HandshakeRequestFrame, RequestFrame, ResponseFrame};
     use serde::{Deserialize, Serialize};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpStream;
@@ -72,7 +73,7 @@ mod tcp_client {
                         Ok(frame) => return Some(frame),
                         Err(_) => {
                             panic!("invalid frame from client, dropping payload");
-                        },
+                        }
                     }
                 }
             }
@@ -106,9 +107,31 @@ mod tcp_client {
     }
 }
 
+#[derive(Parser)]
+enum CliArgs {
+    Check(Check),
+    Bench(Bench),
+}
+
+#[derive(Args, Debug)]
+struct Check {
+    /// Address of the node to stress test
+    #[arg(short, long, default_value = "127.0.0.1")]
+    address: IpAddr,
+    /// Port of the node to stress test
+    #[arg(short, long, default_value_t = 4221)]
+    port: u16,
+    /// The timeout in seconds.
+    #[arg(short, long, default_value = "1")]
+    timeout: f64,
+    /// Do not print the error.
+    #[arg(short, long)]
+    quiet: bool,
+}
+
 /// Cli arguments
-#[derive(Parser, Debug)]
-struct Args {
+#[derive(Args, Debug)]
+struct Bench {
     /// Directory to store worker data output
     #[arg(short, long, default_value = "out")]
     out: PathBuf,
@@ -134,7 +157,65 @@ struct Args {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let args = Args::parse();
+    let args = CliArgs::parse();
+
+    match args {
+        CliArgs::Check(args) => run_check(args).await,
+        CliArgs::Bench(args) => run_bench(args).await,
+    }
+}
+
+async fn run_check(args: Check) -> Result<()> {
+    async fn connect(args: Check) -> Result<()> {
+        let address: SocketAddr = (args.address, args.port).into();
+        let mut client = TcpClient::new(
+            TcpStream::connect(address)
+                .await
+                .context("Could not connect to remote.")?,
+        );
+
+        client
+            .send_handshake(HandshakeRequestFrame::Handshake {
+                retry: None,
+                service: 1001,
+                pk: ClientPublicKey([1; 96]),
+                pop: ClientSignature([2; 48]),
+            })
+            .await
+            .context("Sending handshake frame failed.")?;
+
+        // Read hello frame from the io_stress service.
+        match client
+            .recv()
+            .await
+            .context("Failed to get the handshake response")?
+        {
+            ResponseFrame::ServicePayload { .. } => {}
+            _ => bail!("Unexpected response."),
+        };
+
+        Ok(())
+    }
+
+    let quiet = args.quiet;
+    let duration = Duration::from_millis((args.timeout * 1000.0) as u64);
+    let result = match tokio::time::timeout(duration, connect(args)).await {
+        Ok(result) => result,
+        Err(_) => Err(anyhow!("Timeout reached.")),
+    };
+
+    if quiet {
+        if result.is_ok() {
+            std::process::exit(0);
+        } else {
+            std::process::exit(-1);
+        }
+    }
+
+    result
+}
+
+async fn run_bench(args: Bench) -> Result<()> {
     let address: SocketAddr = (args.address, args.port).into();
 
     if !args.out.exists() {
@@ -228,7 +309,14 @@ async fn run_request(
     data!(line, "handshake_sent", timer);
 
     // Read hello frame from the io_stress service
-    let ResponseFrame::ServicePayload { bytes } = client.recv().await.ok_or(anyhow!("failed to get first byte"))? else { unreachable!() };
+    let ResponseFrame::ServicePayload { bytes } = client
+        .recv()
+        .await
+        .ok_or(anyhow!("failed to get first byte"))?
+    else {
+        unreachable!()
+    };
+
     assert_eq!(bytes.len(), 32);
     data!(line, "handshake_recv", timer);
 
@@ -236,7 +324,13 @@ async fn run_request(
     data!(line, "request_sent", timer);
 
     let mut received = {
-        let ResponseFrame::ServicePayload { bytes } = client.recv().await.ok_or(anyhow!("failed to get first byte"))? else { unreachable!() };
+        let ResponseFrame::ServicePayload { bytes } = client
+            .recv()
+            .await
+            .ok_or(anyhow!("failed to get first byte"))?
+        else {
+            unreachable!()
+        };
         bytes.len()
     };
     data!(line, "first_byte_recv", timer);
@@ -244,7 +338,13 @@ async fn run_request(
     let total_bytes = chunks * chunk_len;
     while received < total_bytes {
         received += {
-            let ResponseFrame::ServicePayload { bytes } = client.recv().await.ok_or(anyhow!("failed to get first byte"))? else { unreachable!() };
+            let ResponseFrame::ServicePayload { bytes } = client
+                .recv()
+                .await
+                .ok_or(anyhow!("failed to get first byte"))?
+            else {
+                unreachable!()
+            };
             bytes.len()
         };
     }
